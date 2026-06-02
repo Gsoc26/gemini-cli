@@ -5,7 +5,14 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { analyzeEvalSource } from '../utils/eval-analysis.js';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  analyzeEvalFiles,
+  analyzeEvalSource,
+  discoverEvalFiles,
+} from '../utils/eval-analysis.js';
 
 describe('eval-analysis', () => {
   it('extracts direct eval helper calls and static metadata', () => {
@@ -54,6 +61,12 @@ describe('eval-analysis', () => {
       hasFiles: true,
       hasPrompt: true,
     });
+    expect(analysis.cases[0]?.tools).toEqual([
+      expect.objectContaining({
+        name: 'run_shell_command',
+        evidence: 'toolRequest.name',
+      }),
+    ]);
   });
 
   it('maps simple local wrapper helpers to their base helper', () => {
@@ -91,6 +104,45 @@ describe('eval-analysis', () => {
       policy: 'USUALLY_PASSES',
       name: 'asks for clarification',
     });
+  });
+
+  it('extracts breakpoint and confirmation tool references', () => {
+    const analysis = analyzeEvalSource(
+      `
+        import { appEvalTest, type AppEvalCase } from './app-test-helper.js';
+        import { type EvalPolicy } from './test-helper.js';
+
+        function askUserEvalTest(policy: EvalPolicy, evalCase: AppEvalCase) {
+          return appEvalTest(policy, evalCase);
+        }
+
+        askUserEvalTest('USUALLY_PASSES', {
+          suiteName: 'default',
+          suiteType: 'behavioral',
+          name: 'asks for clarification',
+          prompt: 'ask me which option to use',
+          setup: async (rig) => {
+            rig.setBreakpoint(['ask_user', 'enter_plan_mode']);
+          },
+          assert: async (rig) => {
+            await rig.waitForPendingConfirmation('ask_user');
+          },
+        });
+      `,
+      { filePath: '/repo/evals/ask_user.eval.ts', repoRoot: '/repo' },
+    );
+
+    expect(analysis.cases[0]?.tools).toEqual([
+      expect.objectContaining({ name: 'ask_user', evidence: 'setBreakpoint' }),
+      expect.objectContaining({
+        name: 'enter_plan_mode',
+        evidence: 'setBreakpoint',
+      }),
+      expect.objectContaining({
+        name: 'ask_user',
+        evidence: 'waitForPendingConfirmation',
+      }),
+    ]);
   });
 
   it('maps imported eval helper aliases', () => {
@@ -143,6 +195,62 @@ describe('eval-analysis', () => {
     ).toEqual([
       'Could not statically resolve policy for evalTest call.',
       'Could not statically resolve eval case object for evalTest call.',
+    ]);
+  });
+
+  it('discovers eval files and aggregates analysis in deterministic order', async () => {
+    const repoRoot = await mkdtemp(path.join(os.tmpdir(), 'eval-analysis-'));
+    const evalRoot = path.join(repoRoot, 'evals');
+    await mkdir(path.join(evalRoot, 'nested'), { recursive: true });
+    await mkdir(path.join(evalRoot, 'logs'), { recursive: true });
+
+    const firstEval = path.join(evalRoot, 'b.eval.ts');
+    const secondEval = path.join(evalRoot, 'nested', 'a.eval.ts');
+    const ignoredLogEval = path.join(evalRoot, 'logs', 'ignored.eval.ts');
+
+    await writeFile(
+      firstEval,
+      `
+        import { evalTest } from './test-helper.js';
+        evalTest('USUALLY_PASSES', {
+          suiteName: 'default',
+          suiteType: 'behavioral',
+          name: 'b case',
+          prompt: 'do b',
+        });
+      `,
+    );
+    await writeFile(
+      secondEval,
+      `
+        import { evalTest } from '../test-helper.js';
+        evalTest('ALWAYS_PASSES', {
+          suiteName: 'default',
+          suiteType: 'behavioral',
+          name: 'a case',
+          prompt: 'do a',
+        });
+      `,
+    );
+    await writeFile(ignoredLogEval, '');
+
+    await expect(discoverEvalFiles(evalRoot)).resolves.toEqual([
+      firstEval,
+      secondEval,
+    ]);
+
+    const inventory = await analyzeEvalFiles([firstEval, secondEval], {
+      repoRoot,
+    });
+
+    expect(inventory.diagnostics).toEqual([]);
+    expect(inventory.files.map((file) => file.relativePath)).toEqual([
+      'evals/b.eval.ts',
+      'evals/nested/a.eval.ts',
+    ]);
+    expect(inventory.cases.map((evalCase) => evalCase.name)).toEqual([
+      'b case',
+      'a case',
     ]);
   });
 });

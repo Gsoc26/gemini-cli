@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import * as ts from 'typescript';
 
@@ -33,6 +34,12 @@ export interface EvalAnalysisDiagnostic {
   location: EvalSourceLocation;
 }
 
+export interface EvalToolReference {
+  name: string;
+  evidence: 'toolRequest.name' | 'setBreakpoint' | 'waitForPendingConfirmation';
+  location: EvalSourceLocation;
+}
+
 export interface EvalCaseRecord {
   filePath: string;
   relativePath: string;
@@ -45,6 +52,7 @@ export interface EvalCaseRecord {
   timeout?: number;
   hasFiles: boolean;
   hasPrompt: boolean;
+  tools: readonly EvalToolReference[];
   location: EvalSourceLocation;
 }
 
@@ -59,6 +67,62 @@ export interface EvalFileAnalysis {
 export interface AnalyzeEvalSourceOptions {
   filePath?: string;
   repoRoot?: string;
+}
+
+export interface EvalInventory {
+  files: readonly EvalFileAnalysis[];
+  cases: readonly EvalCaseRecord[];
+  diagnostics: readonly EvalAnalysisDiagnostic[];
+}
+
+export interface AnalyzeEvalFilesOptions {
+  repoRoot?: string;
+}
+
+export async function discoverEvalFiles(evalRoot = 'evals') {
+  const results: string[] = [];
+
+  async function visit(currentDir: string) {
+    const entries = await readdir(currentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const entryPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== 'logs') {
+          await visit(entryPath);
+        }
+      } else if (entry.isFile() && entry.name.endsWith('.eval.ts')) {
+        results.push(entryPath);
+      }
+    }
+  }
+
+  await visit(evalRoot);
+  return results.sort(compareStrings);
+}
+
+export async function analyzeEvalFiles(
+  filePaths: readonly string[],
+  options: AnalyzeEvalFilesOptions = {},
+): Promise<EvalInventory> {
+  const files = await Promise.all(
+    filePaths.map(async (filePath) =>
+      analyzeEvalSource(await readFile(filePath, 'utf8'), {
+        filePath,
+        repoRoot: options.repoRoot,
+      }),
+    ),
+  );
+
+  files.sort((left, right) =>
+    compareStrings(left.relativePath, right.relativePath),
+  );
+
+  const cases = files.flatMap((file) => file.cases).sort(compareEvalCases);
+  const diagnostics = files
+    .flatMap((file) => file.diagnostics)
+    .sort(compareDiagnostics);
+
+  return { files, cases, diagnostics };
 }
 
 export function analyzeEvalSource(
@@ -130,6 +194,7 @@ export function analyzeEvalSource(
       timeout: getStaticNumberProperty(evalCase, 'timeout'),
       hasFiles: hasProperty(evalCase, 'files'),
       hasPrompt: hasProperty(evalCase, 'prompt'),
+      tools: collectToolReferences(sourceFile, evalCase),
       location: getLocation(sourceFile, callExpression),
     });
   });
@@ -256,6 +321,99 @@ function findCalledHelper(
   return found;
 }
 
+function collectToolReferences(
+  sourceFile: ts.SourceFile,
+  evalCase: ts.ObjectLiteralExpression,
+): EvalToolReference[] {
+  const tools: EvalToolReference[] = [];
+
+  const addTool = (
+    name: string | undefined,
+    evidence: EvalToolReference['evidence'],
+    node: ts.Node,
+  ) => {
+    if (!name) {
+      return;
+    }
+    tools.push({
+      name,
+      evidence,
+      location: getLocation(sourceFile, node),
+    });
+  };
+
+  const visit = (node: ts.Node) => {
+    if (ts.isBinaryExpression(node)) {
+      const leftTool = getToolRequestNameComparison(node.left, node.right);
+      const rightTool = getToolRequestNameComparison(node.right, node.left);
+      addTool(leftTool ?? rightTool, 'toolRequest.name', node);
+    }
+
+    if (ts.isCallExpression(node)) {
+      const callName = getPropertyCallName(node);
+      if (
+        callName === 'setBreakpoint' ||
+        callName === 'waitForPendingConfirmation'
+      ) {
+        for (const toolName of getStaticToolNamesFromExpression(
+          node.arguments[0],
+        )) {
+          addTool(toolName, callName, node);
+        }
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  };
+
+  visit(evalCase);
+  return tools.sort(compareToolReferences);
+}
+
+function getToolRequestNameComparison(
+  candidateNameExpression: ts.Expression,
+  candidateValueExpression: ts.Expression,
+) {
+  if (!isToolRequestNameExpression(candidateNameExpression)) {
+    return undefined;
+  }
+  return getStringLiteralValue(candidateValueExpression);
+}
+
+function isToolRequestNameExpression(expression: ts.Expression) {
+  if (
+    !ts.isPropertyAccessExpression(expression) &&
+    !ts.isPropertyAccessChain(expression)
+  ) {
+    return false;
+  }
+  return (
+    expression.name.text === 'name' &&
+    expression.expression.getText().includes('toolRequest')
+  );
+}
+
+function getStaticToolNamesFromExpression(
+  expression: ts.Expression | undefined,
+): string[] {
+  if (!expression) {
+    return [];
+  }
+
+  const value = getStringLiteralValue(expression);
+  if (value) {
+    return [value];
+  }
+
+  if (ts.isArrayLiteralExpression(expression)) {
+    return expression.elements
+      .map((element) => getStringLiteralValue(element))
+      .filter((element): element is string => Boolean(element));
+  }
+
+  return [];
+}
+
 function getFunctionLikeBindingName(node: ts.Node) {
   if (ts.isFunctionDeclaration(node) && node.name) {
     return node.name.text;
@@ -283,6 +441,12 @@ function getFunctionLikeBindingName(node: ts.Node) {
 function getCalledIdentifierName(callExpression: ts.CallExpression) {
   return ts.isIdentifier(callExpression.expression)
     ? callExpression.expression.text
+    : undefined;
+}
+
+function getPropertyCallName(callExpression: ts.CallExpression) {
+  return ts.isPropertyAccessExpression(callExpression.expression)
+    ? callExpression.expression.name.text
     : undefined;
 }
 
@@ -391,6 +555,18 @@ function compareDiagnostics(
     left.location.line - right.location.line ||
     left.location.column - right.location.column ||
     compareStrings(left.message, right.message)
+  );
+}
+
+function compareToolReferences(
+  left: EvalToolReference,
+  right: EvalToolReference,
+) {
+  return (
+    left.location.line - right.location.line ||
+    left.location.column - right.location.column ||
+    compareStrings(left.name, right.name) ||
+    compareStrings(left.evidence, right.evidence)
   );
 }
 
