@@ -155,6 +155,121 @@ export function formatInventoryReport(result: InventoryResult): string {
   return lines.join('\n');
 }
 
+/**
+ * JSON output schema for machine-readable inventory data.
+ * Version field allows future schema evolution without breaking consumers.
+ */
+export interface InventoryJsonOutput {
+  version: 1;
+  generated: string;
+  summary: {
+    totalFiles: number;
+    totalCases: number;
+    totalDiagnostics: number;
+    byPolicy: Record<string, number>;
+  };
+  cases: InventoryJsonCase[];
+  diagnostics: InventoryJsonDiagnostic[];
+}
+
+interface InventoryJsonCase {
+  name: string;
+  filePath: string;
+  helperName: string;
+  baseHelperName: string;
+  policy: string;
+  suiteName: string | null;
+  suiteType: string | null;
+  timeout: number | null;
+  hasFiles: boolean;
+  hasPrompt: boolean;
+  location: { line: number; column: number };
+}
+
+interface InventoryJsonDiagnostic {
+  severity: string;
+  message: string;
+  filePath: string;
+  location: { line: number; column: number };
+}
+
+/**
+ * Formats an InventoryResult as a stable, machine-readable JSON string.
+ *
+ * @param result - The inventory result to format.
+ * @param now - Optional override for the generated timestamp (for test determinism).
+ * @returns Pretty-printed JSON string.
+ */
+export function formatInventoryJson(
+  result: InventoryResult,
+  now?: Date,
+): string {
+  const filePathLookup = new Map<string, string>();
+  for (const f of result.files) {
+    filePathLookup.set(f.filePath, f.relativePath);
+  }
+
+  const policyCounts = new Map<string, number>();
+  for (const evalCase of result.cases) {
+    policyCounts.set(
+      evalCase.policy,
+      (policyCounts.get(evalCase.policy) ?? 0) + 1,
+    );
+  }
+
+  const policyOrder = [
+    'ALWAYS_PASSES',
+    'USUALLY_PASSES',
+    'USUALLY_FAILS',
+    'unknown',
+  ];
+  const byPolicy: Record<string, number> = {};
+  for (const policy of policyOrder) {
+    const count = policyCounts.get(policy);
+    if (count !== undefined) {
+      byPolicy[policy] = count;
+    }
+  }
+
+  const output: InventoryJsonOutput = {
+    version: 1,
+    generated: (now ?? new Date()).toISOString(),
+    summary: {
+      totalFiles: result.totalFiles,
+      totalCases: result.totalCases,
+      totalDiagnostics: result.diagnostics.length,
+      byPolicy,
+    },
+    cases: result.cases.map((c) => ({
+      name: c.name,
+      filePath: c.relativePath,
+      helperName: c.helperName,
+      baseHelperName: c.baseHelperName,
+      policy: c.policy,
+      suiteName: c.suiteName ?? null,
+      suiteType: c.suiteType ?? null,
+      timeout: c.timeout ?? null,
+      hasFiles: c.hasFiles,
+      hasPrompt: c.hasPrompt,
+      location: { line: c.location.line, column: c.location.column },
+    })),
+    diagnostics: result.diagnostics.map((d) => {
+      const relativePath =
+        d.filePath === '<inline>'
+          ? d.filePath
+          : (filePathLookup.get(d.filePath) ?? d.filePath);
+      return {
+        severity: d.severity,
+        message: d.message,
+        filePath: relativePath,
+        location: { line: d.location.line, column: d.location.column },
+      };
+    }),
+  };
+
+  return JSON.stringify(output, null, 2);
+}
+
 function groupBy<T>(
   items: readonly T[],
   keyFn: (item: T) => string,
