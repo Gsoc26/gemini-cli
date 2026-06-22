@@ -6,6 +6,7 @@
 
 import path from 'node:path';
 import * as ts from 'typescript';
+import { ALL_BUILTIN_TOOL_NAMES } from '@google/gemini-cli-core';
 
 export const BASE_EVAL_HELPERS = [
   'evalTest',
@@ -126,7 +127,7 @@ export function analyzeEvalSource(
       ? getFunctionBody(assertProp.initializer)
       : undefined;
     const toolRefs = assertBody
-      ? collectToolReferences(assertBody, sourceFile, importedConstants)
+      ? collectToolReferences(assertBody, importedConstants)
       : [];
 
     cases.push({
@@ -457,40 +458,53 @@ function compareStrings(left: string, right: string) {
   return left.localeCompare(right, 'en');
 }
 
+const TOOL_NAME_TO_CONSTANT: Record<
+  (typeof ALL_BUILTIN_TOOL_NAMES)[number],
+  string
+> = {
+  glob: 'GLOB_TOOL_NAME',
+  grep_search: 'GREP_TOOL_NAME',
+  list_directory: 'LS_TOOL_NAME',
+  read_file: 'READ_FILE_TOOL_NAME',
+  run_shell_command: 'SHELL_TOOL_NAME',
+  write_file: 'WRITE_FILE_TOOL_NAME',
+  replace: 'EDIT_TOOL_NAME',
+  google_web_search: 'WEB_SEARCH_TOOL_NAME',
+  write_todos: 'WRITE_TODOS_TOOL_NAME',
+  web_fetch: 'WEB_FETCH_TOOL_NAME',
+  read_many_files: 'READ_MANY_FILES_TOOL_NAME',
+  get_internal_docs: 'GET_INTERNAL_DOCS_TOOL_NAME',
+  activate_skill: 'ACTIVATE_SKILL_TOOL_NAME',
+  ask_user: 'ASK_USER_TOOL_NAME',
+  exit_plan_mode: 'EXIT_PLAN_MODE_TOOL_NAME',
+  enter_plan_mode: 'ENTER_PLAN_MODE_TOOL_NAME',
+  update_topic: 'UPDATE_TOPIC_TOOL_NAME',
+  complete_task: 'COMPLETE_TASK_TOOL_NAME',
+  read_mcp_resource: 'READ_MCP_RESOURCE_TOOL_NAME',
+  list_mcp_resources: 'LIST_MCP_RESOURCES_TOOL_NAME',
+  tracker_create_task: 'TRACKER_CREATE_TASK_TOOL_NAME',
+  tracker_update_task: 'TRACKER_UPDATE_TASK_TOOL_NAME',
+  tracker_get_task: 'TRACKER_GET_TASK_TOOL_NAME',
+  tracker_list_tasks: 'TRACKER_LIST_TASKS_TOOL_NAME',
+  tracker_add_dependency: 'TRACKER_ADD_DEPENDENCY_TOOL_NAME',
+  tracker_visualize: 'TRACKER_VISUALIZE_TOOL_NAME',
+  invoke_agent: 'AGENT_TOOL_NAME',
+};
+
 /**
  * Well-known constant names exported from @google/gemini-cli-core that
  * map to tool name string values. Used to resolve identifier references
  * like `waitForToolCall(TRACKER_CREATE_TASK_TOOL_NAME)`.
  */
-const WELL_KNOWN_TOOL_CONSTANTS: Record<string, string> = {
-  GLOB_TOOL_NAME: 'glob',
-  GREP_TOOL_NAME: 'grep_search',
-  LS_TOOL_NAME: 'list_directory',
-  READ_FILE_TOOL_NAME: 'read_file',
-  SHELL_TOOL_NAME: 'run_shell_command',
-  WRITE_FILE_TOOL_NAME: 'write_file',
-  EDIT_TOOL_NAME: 'replace',
-  WEB_SEARCH_TOOL_NAME: 'google_web_search',
-  WRITE_TODOS_TOOL_NAME: 'write_todos',
-  WEB_FETCH_TOOL_NAME: 'web_fetch',
-  READ_MANY_FILES_TOOL_NAME: 'read_many_files',
-  GET_INTERNAL_DOCS_TOOL_NAME: 'get_internal_docs',
-  ACTIVATE_SKILL_TOOL_NAME: 'activate_skill',
-  ASK_USER_TOOL_NAME: 'ask_user',
-  EXIT_PLAN_MODE_TOOL_NAME: 'exit_plan_mode',
-  ENTER_PLAN_MODE_TOOL_NAME: 'enter_plan_mode',
-  UPDATE_TOPIC_TOOL_NAME: 'update_topic',
-  COMPLETE_TASK_TOOL_NAME: 'complete_task',
-  READ_MCP_RESOURCE_TOOL_NAME: 'read_mcp_resource',
-  LIST_MCP_RESOURCES_TOOL_NAME: 'list_mcp_resources',
-  TRACKER_CREATE_TASK_TOOL_NAME: 'tracker_create_task',
-  TRACKER_UPDATE_TASK_TOOL_NAME: 'tracker_update_task',
-  TRACKER_GET_TASK_TOOL_NAME: 'tracker_get_task',
-  TRACKER_LIST_TASKS_TOOL_NAME: 'tracker_list_tasks',
-  TRACKER_ADD_DEPENDENCY_TOOL_NAME: 'tracker_add_dependency',
-  TRACKER_VISUALIZE_TOOL_NAME: 'tracker_visualize',
-  AGENT_TOOL_NAME: 'invoke_agent',
-};
+const WELL_KNOWN_TOOL_CONSTANTS: Record<
+  string,
+  (typeof ALL_BUILTIN_TOOL_NAMES)[number]
+> = Object.fromEntries(
+  Object.entries(TOOL_NAME_TO_CONSTANT).map(([toolName, constantName]) => [
+    constantName,
+    toolName as (typeof ALL_BUILTIN_TOOL_NAMES)[number],
+  ]),
+);
 
 function collectImportedToolNameConstants(
   sourceFile: ts.SourceFile,
@@ -501,7 +515,9 @@ function collectImportedToolNameConstants(
     if (
       !ts.isImportDeclaration(statement) ||
       !statement.importClause?.namedBindings ||
-      !ts.isNamedImports(statement.importClause.namedBindings)
+      !ts.isNamedImports(statement.importClause.namedBindings) ||
+      !ts.isStringLiteral(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== '@google/gemini-cli-core'
     ) {
       continue;
     }
@@ -533,7 +549,6 @@ function getFunctionBody(
 
 function collectToolReferences(
   body: ts.ConciseBody | ts.Block,
-  sourceFile: ts.SourceFile,
   importedConstants: Map<string, string>,
 ): string[] {
   const refs: string[] = [];
@@ -541,17 +556,12 @@ function collectToolReferences(
   const visit = (node: ts.Node) => {
     if (ts.isCallExpression(node)) {
       extractFromWaitForToolCall(node, importedConstants, refs);
-    }
-
-    if (
+      extractFromArrayIncludes(node, importedConstants, refs);
+    } else if (
       ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
     ) {
       extractFromToolRequestNameComparison(node, importedConstants, refs);
-    }
-
-    if (ts.isCallExpression(node)) {
-      extractFromArrayIncludes(node, importedConstants, refs);
     }
 
     ts.forEachChild(node, visit);
@@ -583,17 +593,20 @@ function extractFromWaitForToolCall(
   }
 }
 
+function isToolRequestName(node: ts.Expression): boolean {
+  return (
+    ts.isPropertyAccessExpression(node) &&
+    node.name.text === 'name' &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === 'toolRequest'
+  );
+}
+
 function extractFromToolRequestNameComparison(
   binary: ts.BinaryExpression,
   importedConstants: Map<string, string>,
   refs: string[],
 ) {
-  const isToolRequestName = (node: ts.Expression) =>
-    ts.isPropertyAccessExpression(node) &&
-    node.name.text === 'name' &&
-    ts.isPropertyAccessExpression(node.expression) &&
-    node.expression.name.text === 'toolRequest';
-
   let valueNode: ts.Expression | undefined;
   if (isToolRequestName(binary.left)) {
     valueNode = binary.right;
@@ -616,6 +629,11 @@ function extractFromArrayIncludes(
 ) {
   const expr = call.expression;
   if (!ts.isPropertyAccessExpression(expr) || expr.name.text !== 'includes') {
+    return;
+  }
+
+  const firstArg = call.arguments[0];
+  if (!firstArg || !isToolRequestName(firstArg)) {
     return;
   }
 
