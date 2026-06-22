@@ -6,6 +6,7 @@
 
 import path from 'node:path';
 import * as ts from 'typescript';
+import { ALL_BUILTIN_TOOL_NAMES } from '@google/gemini-cli-core';
 
 export const BASE_EVAL_HELPERS = [
   'evalTest',
@@ -126,7 +127,7 @@ export function analyzeEvalSource(
       ? getFunctionBody(assertProp.initializer)
       : undefined;
     const toolRefs = assertBody
-      ? collectToolReferences(assertBody, sourceFile, importedConstants)
+      ? collectToolReferences(assertBody, importedConstants)
       : [];
 
     cases.push({
@@ -462,7 +463,10 @@ function compareStrings(left: string, right: string) {
  * map to tool name string values. Used to resolve identifier references
  * like `waitForToolCall(TRACKER_CREATE_TASK_TOOL_NAME)`.
  */
-const WELL_KNOWN_TOOL_CONSTANTS: Record<string, string> = {
+const WELL_KNOWN_TOOL_CONSTANTS: Record<
+  string,
+  (typeof ALL_BUILTIN_TOOL_NAMES)[number]
+> = {
   GLOB_TOOL_NAME: 'glob',
   GREP_TOOL_NAME: 'grep_search',
   LS_TOOL_NAME: 'list_directory',
@@ -501,7 +505,9 @@ function collectImportedToolNameConstants(
     if (
       !ts.isImportDeclaration(statement) ||
       !statement.importClause?.namedBindings ||
-      !ts.isNamedImports(statement.importClause.namedBindings)
+      !ts.isNamedImports(statement.importClause.namedBindings) ||
+      !ts.isStringLiteral(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== '@google/gemini-cli-core'
     ) {
       continue;
     }
@@ -533,7 +539,6 @@ function getFunctionBody(
 
 function collectToolReferences(
   body: ts.ConciseBody | ts.Block,
-  sourceFile: ts.SourceFile,
   importedConstants: Map<string, string>,
 ): string[] {
   const refs: string[] = [];
@@ -541,17 +546,12 @@ function collectToolReferences(
   const visit = (node: ts.Node) => {
     if (ts.isCallExpression(node)) {
       extractFromWaitForToolCall(node, importedConstants, refs);
-    }
-
-    if (
+      extractFromArrayIncludes(node, importedConstants, refs);
+    } else if (
       ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
     ) {
       extractFromToolRequestNameComparison(node, importedConstants, refs);
-    }
-
-    if (ts.isCallExpression(node)) {
-      extractFromArrayIncludes(node, importedConstants, refs);
     }
 
     ts.forEachChild(node, visit);
@@ -583,17 +583,20 @@ function extractFromWaitForToolCall(
   }
 }
 
+function isToolRequestName(node: ts.Expression): boolean {
+  return (
+    ts.isPropertyAccessExpression(node) &&
+    node.name.text === 'name' &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === 'toolRequest'
+  );
+}
+
 function extractFromToolRequestNameComparison(
   binary: ts.BinaryExpression,
   importedConstants: Map<string, string>,
   refs: string[],
 ) {
-  const isToolRequestName = (node: ts.Expression) =>
-    ts.isPropertyAccessExpression(node) &&
-    node.name.text === 'name' &&
-    ts.isPropertyAccessExpression(node.expression) &&
-    node.expression.name.text === 'toolRequest';
-
   let valueNode: ts.Expression | undefined;
   if (isToolRequestName(binary.left)) {
     valueNode = binary.right;
@@ -616,6 +619,11 @@ function extractFromArrayIncludes(
 ) {
   const expr = call.expression;
   if (!ts.isPropertyAccessExpression(expr) || expr.name.text !== 'includes') {
+    return;
+  }
+
+  const firstArg = call.arguments[0];
+  if (!firstArg || !isToolRequestName(firstArg)) {
     return;
   }
 
